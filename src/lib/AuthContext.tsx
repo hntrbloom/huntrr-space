@@ -5,8 +5,28 @@ import { LogIn, AlertCircle, UserCircle2 } from 'lucide-react';
 
 let cachedAccessToken: string | null = null;
 
-export const getAccessToken = () => cachedAccessToken;
-export const setAccessToken = (token: string | null) => { cachedAccessToken = token; };
+export const getAccessToken = (): string | null => {
+  if (cachedAccessToken) return cachedAccessToken;
+  try {
+    const stored = sessionStorage.getItem('drive_access_token');
+    if (stored) {
+      cachedAccessToken = stored;
+      return stored;
+    }
+  } catch (_) {}
+  return null;
+};
+
+export const setAccessToken = (token: string | null) => {
+  cachedAccessToken = token;
+  try {
+    if (token) {
+      sessionStorage.setItem('drive_access_token', token);
+    } else {
+      sessionStorage.removeItem('drive_access_token');
+    }
+  } catch (_) {}
+};
 
 interface AuthContextType {
   user: User | null;
@@ -44,7 +64,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const result = await signInWithPopup(auth, provider);
       const credential = GoogleAuthProvider.credentialFromResult(result);
       if (credential?.accessToken) {
-        cachedAccessToken = credential.accessToken;
+        setAccessToken(credential.accessToken);
       }
     } catch (error: any) {
       console.error('Error signing in', error);

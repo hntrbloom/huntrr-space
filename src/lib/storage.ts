@@ -5,7 +5,79 @@ import { uploadImageToService } from './imageService';
 import { v4 as uuidv4 } from 'uuid';
 
 export const compressImageIfNeeded = async (file: File): Promise<File> => {
-  return file;
+  if (!file || !file.type || !file.type.startsWith('image/')) {
+    return file;
+  }
+  
+  if (file.type === 'image/svg+xml' || file.type === 'image/gif') {
+    return file;
+  }
+
+  // If file is already small (under 1MB), skip canvas re-encoding
+  if (file.size <= 1024 * 1024) {
+    return file;
+  }
+
+  return new Promise<File>((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const maxDim = 2048;
+      let width = img.width;
+      let height = img.height;
+
+      if (width <= maxDim && height <= maxDim && file.size <= 1.5 * 1024 * 1024) {
+        resolve(file);
+        return;
+      }
+
+      if (width > maxDim || height > maxDim) {
+        if (width > height) {
+          height = Math.round((height * maxDim) / width);
+          width = maxDim;
+        } else {
+          width = Math.round((width * maxDim) / height);
+          height = maxDim;
+        }
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(file);
+        return;
+      }
+
+      ctx.drawImage(img, 0, 0, width, height);
+      canvas.toBlob(
+        (blob) => {
+          if (blob && blob.size < file.size) {
+            const compressedName = file.name.replace(/\.[^/.]+$/, "") + ".jpg";
+            const compressedFile = new File([blob], compressedName, {
+              type: 'image/jpeg',
+              lastModified: Date.now()
+            });
+            resolve(compressedFile);
+          } else {
+            resolve(file);
+          }
+        },
+        'image/jpeg',
+        0.85
+      );
+    };
+
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(file);
+    };
+
+    img.src = url;
+  });
 };
 
 export const withTimeout = <T>(promise: Promise<T>, timeoutMs = 25000, errorMessage = "Request timed out"): Promise<T> => {
@@ -48,6 +120,7 @@ export const uploadFileToStorage = async (
   };
 
   log(`Processing upload for ${file.name}`);
+  const targetFile = await compressImageIfNeeded(file);
 
   // Parse section and recordId from path if available
   const pathParts = (path || '').split('/').filter(Boolean);
@@ -58,11 +131,11 @@ export const uploadFileToStorage = async (
   if (userId && userId !== 'guest') {
     try {
       const result = await uploadImageToService({
-        file,
+        file: targetFile,
         userId,
         section,
         recordId,
-        filename: file.name,
+        filename: targetFile.name,
         onProgress
       });
       log(`Primary storage upload complete: ${result.downloadURL}`);

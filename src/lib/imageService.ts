@@ -2,14 +2,110 @@ import { storage, db } from './firebase';
 import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
 import { collection, doc, getDocs, getDoc, setDoc, updateDoc } from 'firebase/firestore';
 import { getAccessToken } from './AuthContext';
+import { requestFreshDriveToken } from './driveAuth';
 import { v4 as uuidv4 } from 'uuid';
+
+/**
+ * Direct client-side Google Drive multipart upload using official REST API endpoint:
+ * POST https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,size
+ */
+export async function uploadToGoogleDriveDirect(
+  blob: Blob,
+  filename: string,
+  mimeType: string,
+  accessToken: string
+): Promise<{ id: string }> {
+  const metadata = {
+    name: filename,
+    mimeType: mimeType
+  };
+
+  const boundary = '-------314159265358979323846' + Math.random().toString(36).substring(2, 8);
+  const delimiter = "\r\n--" + boundary + "\r\n";
+  const close_delim = "\r\n--" + boundary + "--";
+
+  const metadataPart = delimiter +
+    'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+    JSON.stringify(metadata) +
+    delimiter +
+    'Content-Type: ' + mimeType + '\r\n\r\n';
+
+  const metadataBlob = new Blob([metadataPart], { type: 'text/plain' });
+  const closeBlob = new Blob([close_delim], { type: 'text/plain' });
+
+  const multipartBlob = new Blob([metadataBlob, blob, closeBlob], {
+    type: `multipart/related; boundary=${boundary}`
+  });
+
+  const performUpload = async (token: string) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 35000); // 35s timeout
+    try {
+      return await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,size', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': `multipart/related; boundary=${boundary}`
+        },
+        body: multipartBlob,
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  };
+
+  let res = await performUpload(accessToken);
+
+  // Requirement: On HTTP 401, clear expired token, obtain genuinely new token, and retry ONCE
+  if (res.status === 401) {
+    console.warn('[DriveDirectUpload] HTTP 401 Unauthorized. Requesting fresh Drive token...');
+    const freshToken = await requestFreshDriveToken(false);
+    if (freshToken) {
+      console.log('[DriveDirectUpload] Fresh token obtained. Retrying Drive upload...');
+      res = await performUpload(freshToken);
+    } else {
+      throw new Error('HTTP 401: Google Drive authorization expired—reconnect Drive.');
+    }
+  }
+
+  if (res.status === 403) {
+    const errJson = await res.json().catch(() => ({}));
+    const reason = errJson?.error?.message || errJson?.error?.errors?.[0]?.reason || 'Permission denied or API disabled';
+    console.error('[DriveDirectUpload] HTTP 403:', reason);
+    throw new Error(`Drive rejected upload: HTTP 403 - ${reason}`);
+  }
+
+  if (res.status === 429 || res.status >= 500) {
+    console.warn(`[DriveDirectUpload] HTTP ${res.status}. Retrying after 1.5s backoff...`);
+    await new Promise(r => setTimeout(r, 1500));
+    res = await performUpload(accessToken);
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Drive upload rejected: HTTP ${res.status}. ${errText || res.statusText}`);
+  }
+
+  const data = await res.json();
+  if (data && data.id) {
+    return { id: data.id };
+  }
+
+  throw new Error("Drive upload response did not return a valid file ID.");
+}
 
 export interface ImageMetaData {
   storagePath: string;
   downloadURL: string;
   driveFileId: string | null;
+  thumbStoragePath?: string;
+  thumbDownloadURL?: string;
+  thumbDriveFileId?: string | null;
   mimeType: string;
   filename: string;
+  width?: number;
+  height?: number;
   status: 'ready' | 'uploading' | 'error' | 'unrecoverable';
 }
 
@@ -20,7 +116,6 @@ export interface MigrationReport {
   details: string[];
 }
 
-// Timeout helper
 export const withTimeout = <T>(promise: Promise<T>, timeoutMs = 20000, errorMessage = "Operation timed out"): Promise<T> => {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -39,7 +134,6 @@ export const withTimeout = <T>(promise: Promise<T>, timeoutMs = 20000, errorMess
   });
 };
 
-// Convert Data URL / Base64 to Blob
 export function dataURLtoBlob(dataurl: string): { blob: Blob; mimeType: string } {
   const arr = dataurl.split(',');
   const mimeMatch = arr[0].match(/:(.*?);/);
@@ -53,7 +147,6 @@ export function dataURLtoBlob(dataurl: string): { blob: Blob; mimeType: string }
   return { blob: new Blob([u8arr], { type: mimeType }), mimeType };
 }
 
-// Convert File or Blob to Base64 String
 export function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -68,92 +161,125 @@ export function blobToBase64(blob: Blob): Promise<string> {
 }
 
 /**
- * Centralized upload service that stores images in Firebase Storage and backs them up to Google Drive.
+ * Uploads optimized image and thumbnail image to Firebase Storage and Google Drive.
  */
 export async function uploadImageToService({
   file,
+  thumbnailFile,
   dataUrl,
   userId,
   section,
   recordId,
   filename,
+  width,
+  height,
   onProgress
 }: {
   file?: File | Blob | null;
+  thumbnailFile?: File | Blob | null;
   dataUrl?: string | null;
   userId: string;
   section: string;
   recordId: string;
   filename?: string;
+  width?: number;
+  height?: number;
   onProgress?: (progress: number) => void;
 }): Promise<ImageMetaData> {
   if (onProgress) onProgress(10);
 
   let targetBlob: Blob;
-  let targetMimeType = 'image/jpeg';
-  let targetFilename = filename || (file && (file as File).name) || `photo_${Date.now()}.jpg`;
+  let targetMimeType = 'image/webp';
+  let targetFilename = filename || (file && (file as File).name) || `photo_${Date.now()}.webp`;
 
   if (file) {
     targetBlob = file;
-    targetMimeType = file.type || 'image/jpeg';
+    targetMimeType = file.type || 'image/webp';
   } else if (dataUrl && dataUrl.startsWith('data:')) {
     const converted = dataURLtoBlob(dataUrl);
     targetBlob = converted.blob;
     targetMimeType = converted.mimeType;
   } else {
-    throw new Error('No valid file or data URL provided for upload');
+    throw new Error('No valid image file provided for upload');
   }
 
-  // Sanitize filename
-  const cleanName = targetFilename.replace(/[^a-zA-Z0-9_.-]/g, '_');
+  const cleanName = targetFilename.replace(/\.[^/.]+$/, '').replace(/[^a-zA-Z0-9_.-]/g, '_');
+  const ext = targetMimeType === 'image/webp' ? 'webp' : 'jpg';
   const uniqueId = uuidv4().substring(0, 8);
-  const storagePath = `users/${userId}/photos/${section}/${recordId}/${uniqueId}-${cleanName}`;
+
+  const storagePath = `users/${userId}/photos/${section}/${recordId}/${uniqueId}-${cleanName}.${ext}`;
+  const thumbStoragePath = thumbnailFile ? `users/${userId}/photos/${section}/${recordId}/${uniqueId}-thumb-${cleanName}.${ext}` : undefined;
 
   if (onProgress) onProgress(25);
 
-  // 1. Upload to Firebase Storage
+  // 1. Upload main optimized file to Firebase Storage
   const storageRef = ref(storage, storagePath);
   const snapshot = await withTimeout(
     uploadBytes(storageRef, targetBlob, { contentType: targetMimeType }),
     20000,
     `Firebase storage upload timed out for ${cleanName}`
   );
-
-  if (onProgress) onProgress(65);
-
-  // 2. Get download URL from Firebase Storage
   const downloadURL = await withTimeout(
     getDownloadURL(snapshot.ref),
     10000,
     `Failed to retrieve download URL for ${cleanName}`
   );
 
-  if (onProgress) onProgress(80);
+  if (onProgress) onProgress(50);
 
-  // 3. Backup to Google Drive asynchronously via secure backend API
+  // 2. Upload thumbnail file to Firebase Storage if available
+  let thumbDownloadURL: string | undefined = undefined;
+  if (thumbnailFile && thumbStoragePath) {
+    try {
+      const thumbRef = ref(storage, thumbStoragePath);
+      const thumbSnapshot = await withTimeout(
+        uploadBytes(thumbRef, thumbnailFile, { contentType: thumbnailFile.type || targetMimeType }),
+        15000,
+        `Thumbnail upload timed out`
+      );
+      thumbDownloadURL = await getDownloadURL(thumbSnapshot.ref);
+    } catch (thumbErr) {
+      console.warn('Thumbnail Firebase storage upload skipped or failed:', thumbErr);
+    }
+  }
+
+  if (onProgress) onProgress(75);
+
+  // 3. Backup main photo and thumbnail to Google Drive
   let driveFileId: string | null = null;
-  try {
-    const accessToken = getAccessToken();
-    if (accessToken) {
-      const base64Data = await blobToBase64(targetBlob);
-      const res = await fetch('/api/drive/backup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          section,
-          filename: `${uniqueId}-${cleanName}`,
-          mimeType: targetMimeType,
-          base64Data,
-          accessToken,
-        }),
-      });
-      const data = await res.json();
-      if (data.success && data.driveFileId) {
-        driveFileId = data.driveFileId;
+  let thumbDriveFileId: string | null = null;
+
+  const accessToken = getAccessToken();
+  if (accessToken) {
+    try {
+      const driveResult = await uploadToGoogleDriveDirect(targetBlob, `${uniqueId}-${cleanName}.${ext}`, targetMimeType, accessToken);
+      if (driveResult?.id) {
+        driveFileId = driveResult.id;
+      }
+    } catch (driveErr: any) {
+      console.error('Google Drive direct upload error:', driveErr?.message || driveErr);
+      throw new Error(driveErr?.message || "Google Drive upload failed.");
+    }
+
+    if (thumbnailFile) {
+      try {
+        const thumbDriveResult = await uploadToGoogleDriveDirect(
+          thumbnailFile,
+          `${uniqueId}-thumb-${cleanName}.${ext}`,
+          thumbnailFile.type || targetMimeType,
+          accessToken
+        );
+        if (thumbDriveResult?.id) {
+          thumbDriveFileId = thumbDriveResult.id;
+        }
+      } catch (thumbErr) {
+        console.warn('Thumbnail Drive upload warning:', thumbErr);
       }
     }
-  } catch (driveErr) {
-    console.warn('Google Drive backup skipped or failed:', driveErr);
+  } else {
+    if (userId && userId !== 'guest') {
+      throw new Error("Google Drive is not connected. Please click 'Reconnect Google Drive' to authorize.");
+    }
   }
 
   if (onProgress) onProgress(100);
@@ -162,15 +288,17 @@ export async function uploadImageToService({
     storagePath,
     downloadURL,
     driveFileId,
+    thumbStoragePath,
+    thumbDownloadURL,
+    thumbDriveFileId,
     mimeType: targetMimeType,
     filename: targetFilename,
+    width,
+    height,
     status: 'ready'
   };
 }
 
-/**
- * Image-loading recovery logic
- */
 export async function resolveAndRepairImage(
   imgObj: { downloadURL?: string; url?: string; storagePath?: string; driveFileId?: string },
   userId: string
@@ -179,18 +307,13 @@ export async function resolveAndRepairImage(
   const storagePath = imgObj.storagePath;
   const driveFileId = imgObj.driveFileId;
 
-  // 1. Check if current URL is usable (not blob: or data:)
-  if (currentUrl && !currentUrl.startsWith('blob:') && !currentUrl.startsWith('data:') && !currentUrl.startsWith('idb://')) {
+  if (currentUrl && !currentUrl.startsWith('blob:') && !currentUrl.startsWith('data:') && !currentUrl.startsWith('file:') && !currentUrl.startsWith('idb://')) {
     try {
-      // Test if image URL is alive
       const res = await fetch(currentUrl, { method: 'HEAD' });
       if (res.ok) return currentUrl;
-    } catch (_) {
-      // Fall through to storagePath recovery
-    }
+    } catch (_) {}
   }
 
-  // 2. Try recovering using Firebase storagePath
   if (storagePath && !storagePath.startsWith('idb://') && !storagePath.startsWith('photo_')) {
     try {
       const freshUrl = await getDownloadURL(ref(storage, storagePath));
@@ -200,7 +323,6 @@ export async function resolveAndRepairImage(
     }
   }
 
-  // 3. Try restoring from Google Drive backup if Firebase file was deleted
   if (driveFileId) {
     try {
       const accessToken = getAccessToken();
@@ -212,14 +334,12 @@ export async function resolveAndRepairImage(
         });
         const data = await res.json();
         if (data.success && data.base64Data) {
-          // Re-upload to Firebase Storage
-          const mimeType = data.mimeType || 'image/jpeg';
+          const mimeType = data.mimeType || 'image/webp';
           const { blob } = dataURLtoBlob(`data:${mimeType};base64,${data.base64Data}`);
-          const newPath = storagePath || `users/${userId}/photos/restored/${Date.now()}-${uuidv4().substring(0,6)}.jpg`;
+          const newPath = storagePath || `users/${userId}/photos/restored/${Date.now()}-${uuidv4().substring(0,6)}.webp`;
           const storageRef = ref(storage, newPath);
           await uploadBytes(storageRef, blob, { contentType: mimeType });
-          const restoredUrl = await getDownloadURL(storageRef);
-          return restoredUrl;
+          return await getDownloadURL(storageRef);
         }
       }
     } catch (driveRestoreErr) {
@@ -230,9 +350,6 @@ export async function resolveAndRepairImage(
   return null;
 }
 
-/**
- * Migration helper to scan all Firestore photo fields, repair broken links, upload base64 images, and report results.
- */
 export async function runPhotoMigration(userId: string): Promise<MigrationReport> {
   const report: MigrationReport = {
     totalScanned: 0,
@@ -257,7 +374,6 @@ export async function runPhotoMigration(userId: string): Promise<MigrationReport
         const data = docSnap.data();
         let modified = false;
 
-        // Check array of images or single image fields
         if (Array.isArray(data.images)) {
           const updatedImages = [];
           for (let img of data.images) {
@@ -279,6 +395,8 @@ export async function runPhotoMigration(userId: string): Promise<MigrationReport
                   downloadURL: uploaded.downloadURL,
                   storagePath: uploaded.storagePath,
                   driveFileId: uploaded.driveFileId,
+                  thumbStoragePath: uploaded.thumbStoragePath,
+                  thumbDriveFileId: uploaded.thumbDriveFileId,
                   mimeType: uploaded.mimeType,
                   filename: uploaded.filename,
                   status: 'ready'
@@ -291,30 +409,37 @@ export async function runPhotoMigration(userId: string): Promise<MigrationReport
                 report.details.push(`[${colName}/${docSnap.id}] Base64 image failed upload.`);
                 updatedImages.push(img);
               }
-            } else if (url && url.startsWith('blob:')) {
-              report.unrecoverable++;
-              report.details.push(`[${colName}/${docSnap.id}] Temporary blob URL from previous session was lost.`);
-              if (typeof img === 'object') {
-                updatedImages.push({ ...img, status: 'unrecoverable' });
-              } else {
-                updatedImages.push({ url: '', status: 'unrecoverable' });
+            } else if ((url && (url.startsWith('blob:') || url.startsWith('file:'))) || storagePath) {
+              let freshUrl: string | null = null;
+              if (storagePath) {
+                try {
+                  freshUrl = await getDownloadURL(ref(storage, storagePath));
+                } catch (_) {}
               }
-              modified = true;
-            } else if (storagePath) {
-              try {
-                const freshUrl = await getDownloadURL(ref(storage, storagePath));
+              if (!freshUrl && typeof img === 'object' && img?.driveFileId) {
+                freshUrl = await resolveAndRepairImage({ downloadURL: url, storagePath, driveFileId: img.driveFileId }, userId);
+              }
+
+              if (freshUrl) {
                 updatedImages.push({
                   ...(typeof img === 'object' ? img : {}),
                   url: freshUrl,
                   downloadURL: freshUrl,
-                  storagePath,
+                  storagePath: storagePath || undefined,
                   status: 'ready'
                 });
                 report.recovered++;
-                report.details.push(`[${colName}/${docSnap.id}] Firebase storage URL verified/renewed.`);
+                report.details.push(`[${colName}/${docSnap.id}] Photo recovered with permanent URL.`);
                 modified = true;
-              } catch (err) {
-                updatedImages.push(img);
+              } else {
+                report.unrecoverable++;
+                report.details.push(`[${colName}/${docSnap.id}] Temporary blob/file URL lost.`);
+                if (typeof img === 'object') {
+                  updatedImages.push({ ...img, url: '', status: 'unrecoverable' });
+                } else {
+                  updatedImages.push({ url: '', status: 'unrecoverable' });
+                }
+                modified = true;
               }
             } else {
               updatedImages.push(img);
@@ -328,53 +453,6 @@ export async function runPhotoMigration(userId: string): Promise<MigrationReport
     } catch (colErr) {
       console.warn(`Migration scan for ${colName} skipped or failed:`, colErr);
     }
-  }
-
-  // Scan Character Wiki
-  try {
-    const wikiRef = doc(db, `users/${userId}/preferences`, 'characterWiki');
-    const wikiSnap = await getDoc(wikiRef);
-    if (wikiSnap.exists()) {
-      const wikiData = wikiSnap.data();
-      if (Array.isArray(wikiData.characters)) {
-        let wikiModified = false;
-        const newChars = [...wikiData.characters];
-
-        for (let char of newChars) {
-          if (char.photoUrl && char.photoUrl.startsWith('data:')) {
-            report.totalScanned++;
-            try {
-              const uploaded = await uploadImageToService({
-                dataUrl: char.photoUrl,
-                userId,
-                section: 'wiki',
-                recordId: char.id || uuidv4(),
-              });
-              char.photoUrl = uploaded.downloadURL;
-              char.storagePath = uploaded.storagePath;
-              char.driveFileId = uploaded.driveFileId;
-              report.recovered++;
-              report.details.push(`[Wiki/${char.name || char.id}] Character photo migrated to Firebase Storage & Drive.`);
-              wikiModified = true;
-            } catch (e) {
-              report.unrecoverable++;
-            }
-          } else if (char.photoUrl && char.photoUrl.startsWith('blob:')) {
-            report.totalScanned++;
-            report.unrecoverable++;
-            report.details.push(`[Wiki/${char.name || char.id}] Temporary blob URL lost.`);
-            char.photoUrl = '';
-            wikiModified = true;
-          }
-        }
-
-        if (wikiModified) {
-          await setDoc(wikiRef, { characters: newChars }, { merge: true });
-        }
-      }
-    }
-  } catch (wikiErr) {
-    console.warn('Wiki migration scan skipped:', wikiErr);
   }
 
   return report;

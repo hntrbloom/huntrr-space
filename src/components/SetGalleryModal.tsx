@@ -14,7 +14,7 @@ interface Props {
   onDelete: (keepUngrouped: boolean) => void;
 }
 
-const HorizontalCarousel = ({ images, onImageClick, onSetCover }: { images: any[], onImageClick: (img: {url: string, storagePath?: string}) => void, onSetCover: (url: string) => void }) => {
+const HorizontalCarousel = ({ images, onImageClick, onSetCover }: { images: any[], onImageClick: (img: {url: string, storagePath?: string, driveFileId?: string}) => void, onSetCover: (url: string) => void }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scrollPos, setScrollPos] = useState(0);
   const uniqueImages = getUniqueImages(images);
@@ -45,11 +45,11 @@ const HorizontalCarousel = ({ images, onImageClick, onSetCover }: { images: any[
       >
         {uniqueImages.map((img, idx) => (
           <div 
-            key={idx} 
+            key={img.id || img.storagePath || img.driveFileId || img.url || idx} 
             className="snap-center shrink-0 w-[200px] sm:w-[250px] h-[200px] sm:h-[250px] relative rounded-xl overflow-hidden bg-surface-variant/30 cursor-pointer border border-outline-variant/20 group/img flex items-center justify-center"
-            onClick={() => onImageClick({ url: img.url, storagePath: img.storagePath })}
+            onClick={() => onImageClick({ url: img.url, storagePath: img.storagePath, driveFileId: img.driveFileId })}
           >
-            <SmartImage src={img.url} storagePath={img.storagePath} className="w-full h-full object-contain" />
+            <SmartImage src={img.url} storagePath={img.thumbStoragePath || img.storagePath} driveFileId={img.thumbDriveFileId || img.driveFileId} className="w-full h-full object-contain" />
             <div className="absolute inset-0 bg-black/40 opacity-0 group-hover/img:opacity-100 transition-opacity flex flex-col items-center justify-center p-2">
                {img.type === 'design' && (<button onClick={(e) => { e.stopPropagation(); onSetCover(img.url); }} className="bg-white/90 text-on-surface text-[10px] font-bold px-3 py-1.5 rounded backdrop-blur-sm shadow-sm hover:bg-white transition-colors mb-2">Set as Cover</button>)}
             </div>
@@ -85,7 +85,7 @@ export const SetGalleryModal = ({
   onUpdateFullPrintTime,
   onDelete 
 }: Props) => {
-  const [viewingImage, setViewingImage] = useState<{url: string, storagePath?: string} | null>(null);
+  const [viewingImage, setViewingImage] = useState<{url: string, storagePath?: string, driveFileId?: string} | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [newName, setNewName] = useState(setInfo.name);
 

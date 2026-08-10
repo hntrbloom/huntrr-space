@@ -6,6 +6,7 @@ import { downloadSingleImage, downloadImagesZip } from '../lib/downloadUtils';
 export interface ImageToView {
   url: string;
   storagePath?: string;
+  driveFileId?: string;
   title?: string;
   filename?: string;
 }
@@ -83,10 +84,10 @@ export function ImageViewerModal({ image, allImages, zipTitle, onClose }: ImageV
             onClick={handleDownloadSingle}
             disabled={isDownloadingSingle}
             className="flex items-center gap-2 px-4 py-2 rounded-full bg-primary text-white text-xs md:text-sm font-bold transition-colors hover:bg-primary/90 shadow-md border border-primary/30 disabled:opacity-50"
-            title="Download original high-res photo"
+            title="Download photo"
           >
             {isDownloadingSingle ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
-            <span>Download Original</span>
+            <span>Download Photo</span>
           </button>
 
           <button
@@ -107,6 +108,7 @@ export function ImageViewerModal({ image, allImages, zipTitle, onClose }: ImageV
         <SmartImage
           src={image.url}
           storagePath={image.storagePath}
+          driveFileId={image.driveFileId}
           alt={title}
           className="max-w-full max-h-[80vh] md:max-h-[85vh] object-contain rounded-xl shadow-2xl"
         />
@@ -114,7 +116,7 @@ export function ImageViewerModal({ image, allImages, zipTitle, onClose }: ImageV
 
       {/* Footer info */}
       <div className="text-white/60 text-xs text-center z-10 pb-2">
-        High-Resolution Original • Press ESC or tap outside to close
+        Press ESC or tap outside to close
       </div>
     </div>
   );

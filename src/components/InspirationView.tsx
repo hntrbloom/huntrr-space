@@ -1429,7 +1429,7 @@ export function InspirationView() {
               }}
               className="px-3.5 py-1.5 bg-[#FF6B9E] hover:bg-[#FF6B9E]/90 text-white rounded-full text-xs font-bold transition-colors flex items-center gap-1.5 shadow-sm"
             >
-              <Download className="w-3.5 h-3.5" /> Download Original
+              <Download className="w-3.5 h-3.5" /> Download Photo
             </button>
             {activePhoto.linkUrl && (
               <a 

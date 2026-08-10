@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { Plus, Copy, Box, Search, CheckCircle2, Armchair, ChevronDown, Clock, Tag, Ruler, X, Image as ImageIcon, LayoutGrid, List, Filter, Edit3, Trash2, Maximize2, Settings, Download, Loader2 } from 'lucide-react';
+import { Plus, Copy, Box, Search, CheckCircle2, Armchair, ChevronDown, Clock, Tag, Ruler, X, Image as ImageIcon, LayoutGrid, List, Filter, Edit3, Trash2, Maximize2, Settings, Download, Loader2, AlertCircle } from 'lucide-react';
 import JSZip from 'jszip';
 import { saveAs } from 'file-saver';
 import { ImageUploaderArea } from './ui/ImageUploaderArea';
@@ -8,6 +8,7 @@ import { useAuth } from '../lib/AuthContext';
 import { db, safeGetDoc } from '../lib/firebase';
 import { collection, doc, onSnapshot, setDoc, deleteDoc } from 'firebase/firestore';
 import { uploadFileToStorage, uploadDataUrlToStorage, deleteFileFromStorage } from '../lib/storage';
+import { printUploadQueue, PhotoTask } from '../lib/printUploadQueue';
 import { SmartImage } from './SmartImage';
 import { ImageViewerModal, ImageToView } from './ImageViewerModal';
 import { downloadImagesZip } from '../lib/downloadUtils';
@@ -24,6 +25,14 @@ export interface MiniFurnitureImage {
   id: string;
   url: string;
   storagePath?: string;
+  driveFileId?: string;
+  thumbDriveFileId?: string;
+  thumbStoragePath?: string;
+  mimeType?: string;
+  width?: number;
+  height?: number;
+  filename?: string;
+  status?: 'ready' | 'uploading' | 'error' | 'unrecoverable';
   type: string;
   label?: string;
 }
@@ -155,6 +164,7 @@ export interface MiniFurniture {
   madeFor: string;
 
   images: MiniFurnitureImage[];
+  uploadStatus?: 'ready' | 'processing' | 'partial' | 'interrupted' | 'failed' | 'uploading' | 'compressing' | 'saving' | string;
   createdAt?: string;
 }
 
@@ -234,13 +244,30 @@ export function normalizePrintRecord(rawDoc: any): MiniFurniture {
     let storagePath: string | undefined = undefined;
     let type: 'inspiration' | 'design' | 'finished' = fallbackType;
     let label = fallbackLabel;
-    let imgId = uuidv4();
+    let driveFileId: string | undefined = undefined;
+
+    let thumbDriveFileId: string | undefined = undefined;
+    let thumbStoragePath: string | undefined = undefined;
+    let mimeType: string | undefined = undefined;
+    let width: number | undefined = undefined;
+    let height: number | undefined = undefined;
+    let filename: string | undefined = undefined;
+    let status: 'ready' | 'uploading' | 'error' | 'unrecoverable' | undefined = undefined;
 
     if (typeof urlOrObj === 'string') {
       url = urlOrObj.trim();
     } else if (typeof urlOrObj === 'object') {
       url = (urlOrObj.url || urlOrObj.src || urlOrObj.downloadUrl || urlOrObj.path || '').trim();
       storagePath = urlOrObj.storagePath || urlOrObj.path || undefined;
+      driveFileId = urlOrObj.driveFileId || urlOrObj.fileId || undefined;
+      thumbDriveFileId = urlOrObj.thumbDriveFileId || undefined;
+      thumbStoragePath = urlOrObj.thumbStoragePath || undefined;
+      mimeType = urlOrObj.mimeType || undefined;
+      width = typeof urlOrObj.width === 'number' ? urlOrObj.width : undefined;
+      height = typeof urlOrObj.height === 'number' ? urlOrObj.height : undefined;
+      filename = urlOrObj.filename || undefined;
+      status = urlOrObj.status || undefined;
+
       if (urlOrObj.type) {
         const rawType = String(urlOrObj.type).toLowerCase();
         if (rawType.includes('ref') || rawType.includes('insp') || rawType.includes('reference')) {
@@ -254,29 +281,50 @@ export function normalizePrintRecord(rawDoc: any): MiniFurniture {
         }
       }
       if (urlOrObj.label) label = urlOrObj.label;
-      if (urlOrObj.id) imgId = urlOrObj.id;
     }
+
+    const keyBase = storagePath || driveFileId || url || `${fallbackType}-${extractedImages.length}`;
+    let imgId = (typeof urlOrObj === 'object' && urlOrObj?.id) ? urlOrObj.id : `img_${keyBase.replace(/[^a-zA-Z0-9]/g, '_')}`;
 
     if (!url && storagePath) {
       url = storagePath;
     }
 
-    if (!url) return;
+    // If url is blob: or file: but storagePath/driveFileId is available, clear blob url so SmartImage repairs it
+    if (url && (url.startsWith('blob:') || url.startsWith('file:'))) {
+      if (storagePath || driveFileId) {
+        url = storagePath || '';
+      } else {
+        // Requirement 7: Mark clearly as unrecoverable without deleting
+        status = 'unrecoverable';
+        url = '';
+      }
+    }
+
+    if (!url && !storagePath && !driveFileId && status !== 'unrecoverable') return;
 
     // Check duplicate
-    const newKey = (storagePath || url).toLowerCase().trim();
+    const newKey = (storagePath || driveFileId || url || imgId).toLowerCase().trim();
     const isDuplicate = extractedImages.some(existing => {
-      const existingKey = (existing.storagePath || existing.url).toLowerCase().trim();
+      const existingKey = (existing.storagePath || existing.driveFileId || existing.url || existing.id).toLowerCase().trim();
       return existingKey === newKey;
     });
 
     if (!isDuplicate) {
       const cleanImg: MiniFurnitureImage = {
         id: imgId,
-        url,
+        url: url || storagePath || '',
         type
       };
       if (storagePath && storagePath !== url) cleanImg.storagePath = storagePath;
+      if (driveFileId) cleanImg.driveFileId = driveFileId;
+      if (thumbDriveFileId) cleanImg.thumbDriveFileId = thumbDriveFileId;
+      if (thumbStoragePath) cleanImg.thumbStoragePath = thumbStoragePath;
+      if (mimeType) cleanImg.mimeType = mimeType;
+      if (width) cleanImg.width = width;
+      if (height) cleanImg.height = height;
+      if (filename) cleanImg.filename = filename;
+      if (status) cleanImg.status = status;
       if (label) cleanImg.label = label;
       extractedImages.push(cleanImg);
     }
@@ -362,6 +410,7 @@ export function normalizePrintRecord(rawDoc: any): MiniFurniture {
     setName,
     setId,
     madeFor,
+    uploadStatus: rawDoc.uploadStatus || 'ready',
     images: extractedImages
   };
 }
@@ -414,6 +463,131 @@ async function fetchImageBlob(url: string): Promise<Blob> {
     });
   }
 }
+
+const PrintUploadStatusBadge = ({ 
+  item, 
+  onSelectPhoto 
+}: { 
+  item: MiniFurniture; 
+  onSelectPhoto?: () => void; 
+}) => {
+  const queueState = printUploadQueue.getPrintUploadState(item.id);
+
+  if (queueState) {
+    const total = queueState.tasks.length;
+    const saved = queueState.tasks.filter(t => t.status === 'saved').length;
+    const failed = queueState.tasks.filter(t => t.status === 'failed' || t.status === 'interrupted').length;
+
+    if (queueState.overallStatus === 'processing') {
+      return (
+        <div className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-primary/10 text-primary rounded-full text-xs font-bold animate-pulse border border-primary/20 shrink-0">
+          <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+          <span>Uploading {saved + 1} of {total} photos</span>
+        </div>
+      );
+    }
+
+    if (failed > 0) {
+      const hasMissingBlob = queueState.tasks.some(t => (t.status === 'failed' || t.status === 'interrupted') && !t.file);
+      return (
+        <div className="inline-flex items-center gap-2 bg-error/10 text-error px-2.5 py-1 rounded-full text-xs font-bold border border-error/20 shrink-0">
+          <span>{failed} photo{failed > 1 ? 's' : ''} {hasMissingBlob ? 'interrupted' : 'failed'}</span>
+          {hasMissingBlob ? (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (onSelectPhoto) onSelectPhoto();
+              }}
+              className="text-primary hover:underline font-extrabold bg-white px-2 py-0.5 rounded-full shadow-sm text-[11px]"
+            >
+              Select Photo Again
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                printUploadQueue.retryFailedPhotos(item.id);
+              }}
+              className="text-primary hover:underline font-extrabold bg-white px-2 py-0.5 rounded-full shadow-sm text-[11px]"
+            >
+              Retry
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    if (queueState.overallStatus === 'ready') {
+      return (
+        <div className="inline-flex items-center gap-1 px-2.5 py-1 bg-[#E8F5E9] text-[#2E7D32] rounded-full text-xs font-bold border border-[#C8E6C9] shrink-0">
+          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+          <span>Photos saved</span>
+        </div>
+      );
+    }
+  }
+
+  // Handle persisted uploadStatus when queue state is no longer in memory
+  const hasImages = Array.isArray(item.images) && item.images.length > 0 && item.images.some(img => img.driveFileId || img.storagePath || (img.url && !img.url.startsWith('blob:')));
+
+  if (item.uploadStatus === 'processing' || item.uploadStatus === 'uploading' || item.uploadStatus === 'compressing' || item.uploadStatus === 'saving') {
+    if (hasImages) {
+      return (
+        <div className="inline-flex items-center gap-1 px-2.5 py-1 bg-[#E8F5E9] text-[#2E7D32] rounded-full text-xs font-bold border border-[#C8E6C9] shrink-0">
+          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+          <span>Photos saved</span>
+        </div>
+      );
+    }
+    return (
+      <div className="inline-flex items-center gap-2 bg-amber-500/10 text-amber-700 px-2.5 py-1 rounded-full text-xs font-bold border border-amber-500/20 shrink-0">
+        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+        <span>Upload interrupted</span>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (onSelectPhoto) onSelectPhoto();
+          }}
+          className="text-primary hover:underline font-extrabold bg-white px-2 py-0.5 rounded-full shadow-sm text-[11px]"
+        >
+          Select Photo Again
+        </button>
+      </div>
+    );
+  }
+
+  if (item.uploadStatus === 'interrupted' || item.uploadStatus === 'partial' || item.uploadStatus === 'failed') {
+    if (hasImages) {
+      return (
+        <div className="inline-flex items-center gap-1 px-2.5 py-1 bg-[#E8F5E9] text-[#2E7D32] rounded-full text-xs font-bold border border-[#C8E6C9] shrink-0">
+          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+          <span>Photos saved</span>
+        </div>
+      );
+    }
+    return (
+      <div className="inline-flex items-center gap-2 bg-error/10 text-error px-2.5 py-1 rounded-full text-xs font-bold border border-error/20 shrink-0">
+        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+        <span>Upload incomplete</span>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (onSelectPhoto) onSelectPhoto();
+          }}
+          className="text-primary hover:underline font-extrabold bg-white px-2 py-0.5 rounded-full shadow-sm text-[11px]"
+        >
+          Select Photo Again
+        </button>
+      </div>
+    );
+  }
+
+  return null;
+};
 
 export const MiniFurnitureView = () => {
   const { user } = useAuth();
@@ -495,6 +669,13 @@ export const MiniFurnitureView = () => {
   const [isDownloadingCategory, setIsDownloadingCategory] = useState(false);
   const [isCategoryManagerOpen, setIsCategoryManagerOpen] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
+  const [, setUploadTick] = useState(0);
+
+  useEffect(() => {
+    return printUploadQueue.subscribe(() => {
+      setUploadTick(prev => prev + 1);
+    });
+  }, []);
   
   useEffect(() => {
     if (!user) return;
@@ -976,13 +1157,13 @@ export const MiniFurnitureView = () => {
                           {showSingleImage ? (
                             <div 
                               className="w-full bg-surface-variant/50 relative cursor-pointer h-full"
-                              onClick={() => mainImg && setViewingImage({ url: mainImg.url, storagePath: mainImg.storagePath })}
+                              onClick={() => mainImg && setViewingImage({ url: mainImg.url, storagePath: mainImg.storagePath, driveFileId: mainImg.driveFileId, filename: item.name })}
                             >
                               <div className="absolute top-2 left-2 z-10 bg-black/60 text-white px-2 py-0.5 rounded text-[9px] font-bold">
                                 {getBadgeText(mainImg)}
                               </div>
                               {mainImg ? (
-                                <SmartImage src={mainImg.url} storagePath={mainImg.storagePath} alt={item.name} className="w-full h-full object-cover" />
+                                <SmartImage src={mainImg.url} storagePath={mainImg.thumbStoragePath || mainImg.storagePath} driveFileId={mainImg.thumbDriveFileId || mainImg.driveFileId} alt={item.name} className="w-full h-full object-cover" />
                               ) : (
                                 <div className="w-full h-full flex flex-col items-center justify-center text-outline gap-1.5 p-2 text-center">
                                   <ImageIcon className="w-6 h-6 opacity-50" />
@@ -994,11 +1175,11 @@ export const MiniFurnitureView = () => {
                             <>
                               <div 
                                 className="w-1/2 bg-surface-variant/50 relative cursor-pointer h-full"
-                                onClick={() => inspirationImg && setViewingImage({ url: inspirationImg.url, storagePath: inspirationImg.storagePath })}
+                                onClick={() => inspirationImg && setViewingImage({ url: inspirationImg.url, storagePath: inspirationImg.storagePath, driveFileId: inspirationImg.driveFileId, filename: item.name })}
                               >
                                 <div className="absolute top-2 left-2 z-10 bg-black/60 text-white px-2 py-0.5 rounded text-[9px] font-bold">Reference</div>
                                 {inspirationImg ? (
-                                  <SmartImage src={inspirationImg.url} storagePath={inspirationImg.storagePath} alt={item.name} className="w-full h-full object-cover" />
+                                  <SmartImage src={inspirationImg.url} storagePath={inspirationImg.thumbStoragePath || inspirationImg.storagePath} driveFileId={inspirationImg.thumbDriveFileId || inspirationImg.driveFileId} alt={item.name} className="w-full h-full object-cover" />
                                 ) : (
                                   <div className="w-full h-full flex flex-col items-center justify-center text-outline gap-1.5 p-2 text-center">
                                     <ImageIcon className="w-6 h-6 opacity-50" />
@@ -1008,11 +1189,11 @@ export const MiniFurnitureView = () => {
                               </div>
                               <div 
                                 className="w-1/2 bg-surface-variant/30 relative cursor-pointer h-full border-l border-outline-variant/10"
-                                onClick={() => designImg && setViewingImage({ url: designImg.url, storagePath: designImg.storagePath })}
+                                onClick={() => designImg && setViewingImage({ url: designImg.url, storagePath: designImg.storagePath, driveFileId: designImg.driveFileId, filename: item.name })}
                               >
                                 <div className="absolute top-2 right-2 z-10 bg-black/60 text-white px-2 py-0.5 rounded text-[9px] font-bold">Mock-Up</div>
                                 {designImg ? (
-                                  <SmartImage src={designImg.url} storagePath={designImg.storagePath} alt={item.name} className="w-full h-full object-cover" />
+                                  <SmartImage src={designImg.url} storagePath={designImg.thumbStoragePath || designImg.storagePath} driveFileId={designImg.thumbDriveFileId || designImg.driveFileId} alt={item.name} className="w-full h-full object-cover" />
                                 ) : (
                                   <div className="w-full h-full flex flex-col items-center justify-center text-outline gap-1.5 p-2 text-center">
                                     <Box className="w-6 h-6 opacity-50" />
@@ -1054,6 +1235,7 @@ export const MiniFurnitureView = () => {
                           </div>
                           
                           <div className="mt-auto pt-3 border-t border-outline-variant/20 flex flex-col gap-2.5">
+                            <PrintUploadStatusBadge item={item} onSelectPhoto={() => { setEditingItem(item); setIsFormOpen(true); }} />
                             {item.status !== 'Completed' && (
                               <div className="inline-flex items-center gap-1 w-max px-2 py-0.5 bg-surface-variant/50 text-on-surface-variant rounded-md text-[10px] font-medium border border-outline-variant/20">
                                 <Clock className="w-3 h-3" /> In Progress
@@ -1088,10 +1270,10 @@ export const MiniFurnitureView = () => {
                       <div key={item.id} className="bg-white rounded-[24px] p-4 shadow-sm border border-outline-variant/20 flex items-center gap-5 transition-colors hover:bg-surface-variant/10">
                         <div 
                           className="h-24 w-24 rounded-[16px] overflow-hidden bg-surface-variant/50 shrink-0 cursor-pointer relative"
-                          onClick={() => mainImg && setViewingImage({ url: mainImg.url, storagePath: mainImg.storagePath })}
+                          onClick={() => mainImg && setViewingImage({ url: mainImg.url, storagePath: mainImg.storagePath, driveFileId: mainImg.driveFileId, filename: item.name })}
                         >
                           {mainImg ? (
-                            <SmartImage src={mainImg.url} storagePath={mainImg.storagePath} alt={item.name} className="w-full h-full object-cover" />
+                            <SmartImage src={mainImg.url} storagePath={mainImg.storagePath} driveFileId={mainImg.driveFileId} alt={item.name} className="w-full h-full object-cover" />
                           ) : (
                             <div className="w-full h-full flex items-center justify-center text-outline">
                               <ImageIcon className="w-8 h-8 opacity-50" />
@@ -1131,6 +1313,7 @@ export const MiniFurnitureView = () => {
                             )}
                           </div>
                           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-on-surface-variant">
+                            <PrintUploadStatusBadge item={item} onSelectPhoto={() => { setEditingItem(item); setIsFormOpen(true); }} />
                             <span className="flex items-center gap-1"><Tag className="w-3.5 h-3.5" /> {item.madeFor || "Object"}</span>
                             <span>•</span>
                             <span className="flex items-center gap-1"><Clock className="w-3.5 h-3.5" /> {item.status}</span>
@@ -1659,13 +1842,17 @@ const FurnitureFormModal = ({ item, categories, printSets, items, onClose, onSav
     setPendingUploads(prev => prev.filter(p => p.type !== typeId));
   };
 
+  const [, setModalUploadTick] = useState(0);
+
   useEffect(() => {
+    const unsub = printUploadQueue.subscribe(() => {
+      setModalUploadTick(prev => prev + 1);
+    });
     const originalStyle = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
     return () => {
+      unsub();
       document.body.style.overflow = originalStyle;
-      // Clean up object URLs
-      pendingUploads.forEach(p => URL.revokeObjectURL(p.previewUrl));
     };
   }, []);
 
@@ -1706,7 +1893,7 @@ const FurnitureFormModal = ({ item, categories, printSets, items, onClose, onSav
   };
 
   const executeSaveAndUploads = async () => {
-    if (!formData.name.trim()) {
+    if (!formData.name || !formData.name.trim()) {
       alert("Print Name is required");
       return;
     }
@@ -1715,86 +1902,14 @@ const FurnitureFormModal = ({ item, categories, printSets, items, onClose, onSav
 
     setIsSaving(true);
     setSaveError(null);
-    setUploadStageText('Preparing photos...');
+    setUploadStageText('Saving print design...');
 
     try {
       const printId = formData.id || uuidv4();
       const currentUserId = user?.uid || 'guest';
+      const isMiniCharm = isMiniCharmItem(formData);
 
-      // 1. Collect photos already uploaded successfully in a previous attempt (retry scenario)
-      const alreadyUploaded = pendingUploads.filter(p => p.status === 'success' && p.uploadedUrl);
-      const toUpload = pendingUploads.filter(p => p.status !== 'success');
-
-      const uploadedResults: MiniFurnitureImage[] = alreadyUploaded.map(p => {
-        const meta: MiniFurnitureImage = {
-          id: p.id,
-          url: p.uploadedUrl!,
-          type: p.type
-        };
-        if (p.uploadedPath) meta.storagePath = p.uploadedPath;
-        if (p.label) meta.label = p.label;
-        return meta;
-      });
-
-      if (toUpload.length > 0) {
-        setUploadStageText(`Uploading ${toUpload.length} photo(s)...`);
-
-        // Update status to uploading
-        setPendingUploads(prev => prev.map(p => 
-          toUpload.some(u => u.id === p.id) ? { ...p, status: 'uploading', error: undefined, progress: 0 } : p
-        ));
-
-        for (const item of toUpload) {
-          try {
-            setUploadStageText(`Uploading ${item.label || item.type} photo...`);
-            const storagePath = `users/${currentUserId}/prints/${printId}/${uuidv4().substring(0, 8)}.jpg`;
-            
-            const res = await uploadFileToStorage(
-              currentUserId, 
-              storagePath, 
-              item.file, 
-              (pct) => {
-                setPendingUploads(prev => prev.map(p => p.id === item.id ? { ...p, progress: pct, status: 'uploading' } : p));
-              },
-              (msg) => {
-                if (msg.includes("Converting iPhone photo")) {
-                  setUploadStageText(msg);
-                }
-              }
-            );
-
-            if (!res || !res.url) {
-              throw new Error("URL retrieval failed: Empty download URL returned from Storage");
-            }
-
-            const cleanPhotoMeta: MiniFurnitureImage = {
-              id: item.id,
-              url: res.url,
-              type: item.type
-            };
-            if (res.path) cleanPhotoMeta.storagePath = res.path;
-            if (item.label) cleanPhotoMeta.label = item.label;
-
-            uploadedResults.push(cleanPhotoMeta);
-
-            // Mark as success
-            setPendingUploads(prev => prev.map(p => p.id === item.id ? { 
-              ...p, 
-              status: 'success', 
-              progress: 100, 
-              uploadedUrl: res.url, 
-              uploadedPath: res.path,
-              error: undefined
-            } : p));
-          } catch (err: any) {
-            const errMsg = err?.message || 'Upload failed';
-            setPendingUploads(prev => prev.map(p => p.id === item.id ? { ...p, status: 'error', error: errMsg } : p));
-            throw new Error(`Upload stage failed for photo (${item.type}): ${errMsg}`);
-          }
-        }
-      }
-
-      // Combine existing images (sanitized) + newly uploaded clean images
+      // Collect existing clean images that are already saved
       const cleanExistingImages: MiniFurnitureImage[] = (formData.images || [])
         .filter(img => img && img.url && !img.url.startsWith('blob:') && !img.url.startsWith('data:'))
         .map(img => {
@@ -1808,51 +1923,65 @@ const FurnitureFormModal = ({ item, categories, printSets, items, onClose, onSav
           return meta;
         });
 
-      let finalImages = [...cleanExistingImages, ...uploadedResults];
-
-      if (isMiniCharmItem(formData) && finalImages.length > 0) {
-        const finishedImg = finalImages.find(img => img.type === 'finished');
-        finalImages = finishedImg ? [finishedImg] : [finalImages[0]];
+      let finalExisting = cleanExistingImages;
+      if (isMiniCharm && finalExisting.length > 0) {
+        const finishedImg = finalExisting.find(img => img.type === 'finished');
+        finalExisting = finishedImg ? [finishedImg] : [finalExisting[0]];
       }
 
-      setUploadStageText('Saving print metadata to Firestore...');
-      const finalFormData: MiniFurniture = {
+      const hasPendingNewUploads = pendingUploads.length > 0;
+      const initialUploadStatus = hasPendingNewUploads ? 'processing' : 'ready';
+
+      const initialPrintPayload: MiniFurniture = {
         ...formData,
         id: printId,
-        images: finalImages
+        images: finalExisting,
+        uploadStatus: initialUploadStatus
       };
 
-      const cleanPrintPayload = sanitizeFirestorePayload(finalFormData);
+      const cleanPrintPayload = sanitizeFirestorePayload(initialPrintPayload);
 
-      try {
-        await onSave(cleanPrintPayload);
+      // 1. SAVE PRINT RECORD IMMEDIATELY TO FIRESTORE
+      await onSave(cleanPrintPayload);
 
-        // Clean up orphaned images that were removed during editing
-        if (item && item.images) {
-          const newImageIds = new Set(finalImages.map(img => img.id));
-          for (const oldImg of item.images) {
-            if (!newImageIds.has(oldImg.id) && oldImg.storagePath) {
-              deleteFileFromStorage(oldImg.storagePath).catch(err => {
-                console.warn("Failed to clean up orphaned image from storage:", err);
-              });
-            }
+      // Clean up orphaned images that were removed during editing
+      if (item && item.images) {
+        const newImageIds = new Set(finalExisting.map(img => img.id));
+        for (const oldImg of item.images) {
+          if (!newImageIds.has(oldImg.id) && oldImg.storagePath) {
+            deleteFileFromStorage(oldImg.storagePath).catch(err => {
+              console.warn("Failed to clean up orphaned image from storage:", err);
+            });
           }
         }
-      } catch (saveErr: any) {
-        throw new Error(`Firestore save stage failed: ${saveErr?.message || 'Firestore write error'}`);
+      }
+
+      // 2. ENQUEUE NEW PHOTOS TO BACKGROUND UPLOAD QUEUE
+      if (hasPendingNewUploads) {
+        const tasks: PhotoTask[] = pendingUploads.map(p => ({
+          id: p.id,
+          file: p.file,
+          previewUrl: p.previewUrl,
+          type: p.type,
+          label: p.label,
+          status: 'preparing',
+          progress: 0
+        }));
+
+        printUploadQueue.enqueuePrintUpload(currentUserId, printId, isMiniCharm, tasks);
       }
 
       setSaveSuccess(true);
-      setUploadStageText('Saved successfully!');
+      setUploadStageText('Print saved!');
 
+      // Close modal immediately so the user sees the saved Print in the view
       setTimeout(() => {
         onClose();
-      }, 600);
+      }, 300);
     } catch (err: any) {
       console.error("Save print failed:", err);
-      const realErrorMsg = err?.message || String(err) || 'Failed to save print design. Please retry.';
+      const realErrorMsg = err?.message || String(err) || 'Failed to save print design.';
       setSaveError(realErrorMsg);
-      setPendingUploads(prev => prev.map(p => p.status === 'uploading' ? { ...p, status: 'error', error: realErrorMsg } : p));
     } finally {
       setIsSaving(false);
       setUploadStageText('');
@@ -1994,7 +2123,7 @@ const FurnitureFormModal = ({ item, categories, printSets, items, onClose, onSav
                             {/* Saved Images */}
                             {sectionImages.map(img => (
                               <div key={img.id} className="relative aspect-square rounded-2xl overflow-hidden group bg-surface-variant/30 border border-outline-variant/20 shadow-sm touch-pan-y">
-                                <SmartImage src={img.url} storagePath={img.storagePath} alt="Uploaded" className="w-full h-full object-cover touch-pan-y" />
+                                <SmartImage src={img.url} storagePath={img.storagePath} driveFileId={img.driveFileId} alt="Uploaded" className="w-full h-full object-cover touch-pan-y" />
                                 <button 
                                   type="button" 
                                   onClick={(e) => { e.stopPropagation(); removeImage(img.id); }} 
@@ -2008,44 +2137,70 @@ const FurnitureFormModal = ({ item, categories, printSets, items, onClose, onSav
                             ))}
 
                             {/* Pending Instant Previews */}
-                            {sectionPending.map(p => (
-                              <div key={p.id} className="relative aspect-square rounded-2xl overflow-hidden group bg-surface-variant/30 border border-outline-variant/20 shadow-sm touch-pan-y">
-                                <img src={p.previewUrl} alt="Preview" className="w-full h-full object-cover opacity-90" />
-                                
-                                <button 
-                                  type="button" 
-                                  onClick={() => removePendingUpload(p.id)} 
-                                  className="absolute top-3 right-3 bg-white/90 hover:bg-error hover:text-white text-on-surface p-2 rounded-full shadow-md transition-colors backdrop-blur-sm z-10"
-                                  title="Remove preview"
-                                  disabled={isSaving}
-                                >
-                                  <X className="w-4 h-4" />
-                                </button>
+                            {sectionPending.map(p => {
+                              const queueState = printUploadQueue.getPrintUploadState(formData.id);
+                              const queueTask = queueState?.tasks.find(t => t.id === p.id);
+                              const status = queueTask?.status || p.status || 'preparing';
+                              const progress = queueTask?.progress ?? p.progress ?? 0;
+                              const errorMsg = queueTask?.error || p.error;
 
-                                {p.status === 'uploading' && (
-                                  <div className="absolute inset-0 bg-black/50 backdrop-blur-[2px] flex flex-col items-center justify-center p-4 text-white">
-                                    <div className="w-full bg-white/30 rounded-full h-2 mb-2 overflow-hidden">
-                                      <div className="bg-primary h-full transition-all duration-300" style={{ width: `${Math.max(10, p.progress)}%` }} />
+                              return (
+                                <div key={p.id} className="relative aspect-square rounded-2xl overflow-hidden group bg-surface-variant/30 border border-outline-variant/20 shadow-sm touch-pan-y">
+                                  <img src={p.previewUrl} alt="Preview" className="w-full h-full object-cover opacity-90" />
+                                  
+                                  <button 
+                                    type="button" 
+                                    onClick={() => {
+                                      printUploadQueue.removePendingTask(formData.id, p.id);
+                                      removePendingUpload(p.id);
+                                    }} 
+                                    className="absolute top-3 right-3 bg-white/90 hover:bg-error hover:text-white text-on-surface p-2 rounded-full shadow-md transition-colors backdrop-blur-sm z-10"
+                                    title="Remove preview"
+                                    disabled={isSaving}
+                                  >
+                                    <X className="w-4 h-4" />
+                                  </button>
+
+                                  {status === 'preparing' && (
+                                    <div className="absolute inset-0 bg-black/40 backdrop-blur-[1px] flex flex-col items-center justify-center p-3 text-white text-center">
+                                      <Loader2 className="w-5 h-5 animate-spin mb-1" />
+                                      <span className="text-xs font-bold">Preparing...</span>
                                     </div>
-                                    <span className="text-xs font-bold">{p.progress > 0 ? `${p.progress}% Uploading` : 'Uploading...'}</span>
-                                  </div>
-                                )}
+                                  )}
 
-                                {p.status === 'error' && (
-                                  <div className="absolute inset-0 bg-error/80 backdrop-blur-[2px] flex flex-col items-center justify-center p-3 text-white text-center">
-                                    <span className="text-xs font-bold mb-1">Upload Failed</span>
-                                    <span className="text-[10px] mb-2">{p.error || 'Network error'}</span>
-                                    <button 
-                                      type="button" 
-                                      onClick={executeSaveAndUploads} 
-                                      className="px-3 py-1 bg-white text-error rounded-full text-xs font-bold hover:bg-white/90 shadow-sm"
-                                    >
-                                      Retry
-                                    </button>
-                                  </div>
-                                )}
-                              </div>
-                            ))}
+                                  {status === 'uploading' && (
+                                    <div className="absolute inset-0 bg-black/50 backdrop-blur-[2px] flex flex-col items-center justify-center p-4 text-white">
+                                      <div className="w-full bg-white/30 rounded-full h-2 mb-2 overflow-hidden">
+                                        <div className="bg-primary h-full transition-all duration-300" style={{ width: `${Math.max(10, progress)}%` }} />
+                                      </div>
+                                      <span className="text-xs font-bold">{progress > 0 ? `${progress}% Uploading` : 'Uploading...'}</span>
+                                    </div>
+                                  )}
+
+                                  {status === 'saved' && (
+                                    <div className="absolute inset-0 bg-black/30 backdrop-blur-[1px] flex flex-col items-center justify-center p-2 text-white">
+                                      <span className="bg-[#2E7D32] text-white px-2.5 py-1 rounded-full text-xs font-bold flex items-center gap-1 shadow-md">
+                                        <CheckCircle2 className="w-3.5 h-3.5" /> Saved
+                                      </span>
+                                    </div>
+                                  )}
+
+                                  {status === 'failed' && (
+                                    <div className="absolute inset-0 bg-error/80 backdrop-blur-[2px] flex flex-col items-center justify-center p-3 text-white text-center">
+                                      <span className="text-xs font-bold mb-1">Upload Failed</span>
+                                      <span className="text-[10px] mb-2 line-clamp-2">{errorMsg || 'Network error'}</span>
+                                      <button 
+                                        type="button" 
+                                        onClick={() => printUploadQueue.retryFailedPhotos(formData.id)} 
+                                        className="px-3 py-1 bg-white text-error rounded-full text-xs font-bold hover:bg-white/90 shadow-sm"
+                                      >
+                                        Retry
+                                      </button>
+                                    </div>
+                                  )}
+                                </div>
+                              );
+                            })}
 
                             {!isMiniCharm && (
                               <label className="cursor-pointer border-2 border-dashed border-outline-variant/50 rounded-2xl aspect-square flex flex-col items-center justify-center text-on-surface-variant hover:border-primary hover:text-primary transition-colors bg-surface-variant/10">
