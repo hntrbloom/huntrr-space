@@ -1,5 +1,5 @@
 import { storage, db } from './firebase';
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { ref, uploadBytes, uploadBytesResumable, getDownloadURL, type UploadTaskSnapshot } from 'firebase/storage';
 import { collection, doc, getDocs, getDoc, setDoc, updateDoc } from 'firebase/firestore';
 import { getAccessToken } from './AuthContext';
 import { v4 as uuidv4 } from 'uuid';
@@ -109,17 +109,40 @@ export async function uploadImageToService({
   const uniqueId = uuidv4().substring(0, 8);
   const storagePath = `users/${userId}/photos/${section}/${recordId}/${uniqueId}-${cleanName}`;
 
-  if (onProgress) onProgress(25);
+  if (onProgress) onProgress(15);
 
   // 1. Upload to Firebase Storage
   const storageRef = ref(storage, storagePath);
+  const uploadTask = uploadBytesResumable(storageRef, targetBlob, {
+    contentType: targetMimeType,
+    cacheControl: 'public,max-age=31536000,immutable',
+  });
+  const firebaseUpload = new Promise<UploadTaskSnapshot>((resolve, reject) => {
+    uploadTask.on(
+      'state_changed',
+      (progressSnapshot) => {
+        if (onProgress && progressSnapshot.totalBytes > 0) {
+          const transferred = progressSnapshot.bytesTransferred / progressSnapshot.totalBytes;
+          onProgress(Math.round(15 + transferred * 60));
+        }
+      },
+      reject,
+      () => resolve(uploadTask.snapshot),
+    );
+  });
+  const driveBackup = backupImageToDrive({
+    blob: targetBlob,
+    section,
+    filename: uniqueId + '-' + cleanName,
+    mimeType: targetMimeType,
+  });
   const snapshot = await withTimeout(
-    uploadBytes(storageRef, targetBlob, { contentType: targetMimeType }),
-    20000,
+    firebaseUpload,
+    60000,
     `Firebase storage upload timed out for ${cleanName}`
   );
 
-  if (onProgress) onProgress(65);
+  if (onProgress) onProgress(78);
 
   // 2. Get download URL from Firebase Storage
   const downloadURL = await withTimeout(
@@ -128,33 +151,13 @@ export async function uploadImageToService({
     `Failed to retrieve download URL for ${cleanName}`
   );
 
-  if (onProgress) onProgress(80);
+  if (onProgress) onProgress(90);
 
   // 3. Backup to Google Drive asynchronously via secure backend API
-  let driveFileId: string | null = null;
-  try {
-    const accessToken = getAccessToken();
-    if (accessToken) {
-      const base64Data = await blobToBase64(targetBlob);
-      const res = await fetch('/api/drive/backup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          section,
-          filename: `${uniqueId}-${cleanName}`,
-          mimeType: targetMimeType,
-          base64Data,
-          accessToken,
-        }),
-      });
-      const data = await res.json();
-      if (data.success && data.driveFileId) {
-        driveFileId = data.driveFileId;
-      }
-    }
-  } catch (driveErr) {
-    console.warn('Google Drive backup skipped or failed:', driveErr);
-  }
+  const driveFileId = await Promise.race<string | null>([
+    driveBackup,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000)),
+  ]);
 
   if (onProgress) onProgress(100);
 
@@ -166,6 +169,35 @@ export async function uploadImageToService({
     filename: targetFilename,
     status: 'ready'
   };
+}
+
+async function backupImageToDrive({
+  blob,
+  section,
+  filename,
+  mimeType,
+}: {
+  blob: Blob;
+  section: string;
+  filename: string;
+  mimeType: string;
+}): Promise<string | null> {
+  try {
+    const accessToken = getAccessToken();
+    if (!accessToken) return null;
+    const base64Data = await blobToBase64(blob);
+    const response = await withTimeout(fetch('/api/drive/backup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ section, filename, mimeType, base64Data, accessToken }),
+    }), 30000, 'Google Drive backup timed out for ' + filename);
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data.success && data.driveFileId ? data.driveFileId : null;
+  } catch (driveErr) {
+    console.warn('Google Drive backup skipped or failed:', driveErr);
+    return null;
+  }
 }
 
 /**
