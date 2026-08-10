@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { User, GoogleAuthProvider, signInWithPopup, signInAnonymously, onAuthStateChanged, signOut } from 'firebase/auth';
-import { auth } from './firebase';
+import { auth, setLocalGuest } from './firebase';
 import { LogIn, AlertCircle, UserCircle2 } from 'lucide-react';
 
 let cachedAccessToken: string | null = null;
@@ -25,6 +25,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (u) => {
+      if (u) {
+        setLocalGuest(false);
+      }
       setUser(u);
       setLoading(false);
     });
@@ -62,21 +65,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       await signInAnonymously(auth);
     } catch (error: any) {
-      console.error('Error signing in anonymously', error);
-      if (error.code === 'auth/operation-not-allowed') {
-        setError('Guest sign-in is not enabled. Please enable Anonymous Auth in your Firebase Console.');
-      } else {
-        setError(error.message || 'An error occurred during guest sign in.');
-      }
+      console.warn('Firebase anonymous sign-in failed or restricted, falling back to local guest session', error);
+      setLocalGuest(true);
+      setUser({
+        uid: 'guest-local-user',
+        isAnonymous: true,
+        displayName: 'Guest User',
+        email: null,
+      } as User);
     }
   };
 
   const logOut = async () => {
     try {
+      setLocalGuest(false);
       await signOut(auth);
+      setUser(null);
       cachedAccessToken = null;
     } catch (error) {
       console.error('Error signing out', error);
+      setLocalGuest(false);
+      setUser(null);
     }
   };
 

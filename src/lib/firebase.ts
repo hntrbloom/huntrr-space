@@ -41,10 +41,15 @@ try {
 
 export const auth = getAuth(app);
 
+let localGuestMode = false;
+export function setLocalGuest(val: boolean) {
+  localGuestMode = val;
+}
+
 // Proxy db to switch based on auth state
 export const db = new Proxy(realDb, {
   get(target, prop) {
-    const isGuest = auth.currentUser?.isAnonymous;
+    const isGuest = auth.currentUser?.isAnonymous || localGuestMode;
     const activeDb = isGuest ? guestDb : realDb;
     const value = (activeDb as any)[prop];
     if (typeof value === 'function') {
@@ -57,7 +62,7 @@ export const db = new Proxy(realDb, {
 export const storage = getStorage(app);
 
 export async function safeGetDoc(ref: DocumentReference) {
-  if (auth.currentUser?.isAnonymous) {
+  if (auth.currentUser?.isAnonymous || localGuestMode) {
     try {
       return await fGetDocFromCache(ref);
     } catch (e) {
@@ -76,7 +81,7 @@ export async function safeGetDoc(ref: DocumentReference) {
 }
 
 export async function safeGetDocs(query: Query) {
-  if (auth.currentUser?.isAnonymous) {
+  if (auth.currentUser?.isAnonymous || localGuestMode) {
     try {
       return await fGetDocsFromCache(query);
     } catch (e) {

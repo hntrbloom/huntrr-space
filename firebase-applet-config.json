@@ -3,6 +3,7 @@
   "appId": "1:495117552717:web:be231707991a15f857a004",
   "apiKey": "AIzaSyBa-tH7x_MdBE_aitFDByp5eH0Tj959cXI",
   "authDomain": "huntrr-app-1c0de.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-huntrrworkspace-d7ae5fa2-be9a-46f0-ac07-95dab5c07625",
   "storageBucket": "huntrr-app-1c0de.firebasestorage.app",
   "messagingSenderId": "495117552717",
   "measurementId": "",
