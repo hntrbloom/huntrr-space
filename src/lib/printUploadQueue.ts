@@ -10,7 +10,7 @@ export interface PhotoTask {
   previewUrl: string;
   type: string;
   label?: string;
-  status: 'compressing' | 'uploading' | 'saved' | 'failed' | 'interrupted';
+  status: 'preparing' | 'compressing' | 'uploading' | 'saving' | 'saved' | 'failed' | 'interrupted';
   progress: number;
   error?: string;
   uploadedUrl?: string;
@@ -144,7 +144,7 @@ class PrintUploadQueueManager {
     let targetTask: PhotoTask | null = null;
 
     for (const printState of this.activeQueue.values()) {
-      const pending = printState.tasks.find(t => t.status === 'compressing' || (t as any).status === 'preparing');
+      const pending = printState.tasks.find(t => t.status === 'compressing' || t.status === 'preparing');
       if (pending) {
         targetPrint = printState;
         targetTask = pending;
@@ -159,6 +159,10 @@ class PrintUploadQueueManager {
     const { userId, printId, isMiniCharm } = targetPrint;
 
     try {
+      if (!task.file) {
+        throw new Error('The selected photo is no longer available. Please select it again.');
+      }
+
       // Step 1: Compress image (max 1600px main, 480px thumbnail, WebP format)
       task.status = 'compressing';
       task.progress = 10;
@@ -192,8 +196,8 @@ class PrintUploadQueueManager {
         throw new Error("Google Drive upload did not return a valid file ID. Please retry.");
       }
 
-      task.status = 'saved';
-      task.progress = 100;
+      task.status = 'saving';
+      task.progress = 96;
       task.uploadedUrl = uploadRes.downloadURL;
       task.uploadedPath = uploadRes.storagePath;
       task.driveFileId = uploadRes.driveFileId || undefined;
@@ -203,7 +207,6 @@ class PrintUploadQueueManager {
       task.width = processed.width;
       task.height = processed.height;
       task.filename = processed.filename;
-      task.error = undefined;
       this.notify();
 
       // Step 3: Update Firestore record with permanent metadata (never temporary blob URLs!)
@@ -212,7 +215,9 @@ class PrintUploadQueueManager {
           await runTransaction(db, async (transaction) => {
             const docRef = doc(db, `users/${userId}/miniFurniture`, printId);
             const sfDoc = await transaction.get(docRef);
-            if (!sfDoc.exists()) return;
+            if (!sfDoc.exists()) {
+              throw new Error('The print record was not found while saving its photo.');
+            }
 
             const data = sfDoc.data();
             const currentImages = Array.isArray(data.images) ? data.images : [];
@@ -220,7 +225,8 @@ class PrintUploadQueueManager {
             // Filter out temporary blob or data URLs
             let updatedImages = currentImages.filter((img: any) => {
               const url = typeof img === 'string' ? img : img?.url;
-              return url && !url.startsWith('blob:') && !url.startsWith('data:') && !url.startsWith('file:');
+              const hasPermanentUrl = Boolean(url && !url.startsWith('blob:') && !url.startsWith('data:') && !url.startsWith('file:'));
+              return hasPermanentUrl || Boolean(img?.driveFileId) || Boolean(img?.storagePath);
             });
 
             if (isMiniCharm) {
@@ -230,8 +236,8 @@ class PrintUploadQueueManager {
             const existingIndex = updatedImages.findIndex((img: any) => img.id === task.id);
             const newPhotoMeta = sanitizeFirestorePayload({
               id: task.id,
-              url: uploadRes.downloadURL,
-              storagePath: uploadRes.storagePath,
+              url: uploadRes.downloadURL || '',
+              ...(uploadRes.storagePath ? { storagePath: uploadRes.storagePath } : {}),
               ...(uploadRes.driveFileId ? { driveFileId: uploadRes.driveFileId } : {}),
               ...(uploadRes.thumbDriveFileId ? { thumbDriveFileId: uploadRes.thumbDriveFileId } : {}),
               ...(uploadRes.thumbStoragePath ? { thumbStoragePath: uploadRes.thumbStoragePath } : {}),
@@ -251,10 +257,16 @@ class PrintUploadQueueManager {
 
             transaction.update(docRef, { images: updatedImages });
           });
-        } catch (txErr) {
-          console.warn("Transaction update failed during photo save:", txErr);
+        } catch (txErr: any) {
+          console.error('Photo reached Drive but its print record could not be updated:', txErr);
+          throw new Error(`Photo uploaded, but saving its print record failed: ${txErr?.message || 'Firestore update failed'}`);
         }
       }
+
+      task.status = 'saved';
+      task.progress = 100;
+      task.error = undefined;
+      this.notify();
     } catch (err: any) {
       console.error(`Photo upload failed for task ${task.id}:`, err);
       task.status = 'failed';

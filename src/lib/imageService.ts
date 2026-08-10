@@ -13,7 +13,7 @@ export async function uploadToGoogleDriveDirect(
   blob: Blob,
   filename: string,
   mimeType: string,
-  accessToken: string
+  accessToken?: string | null
 ): Promise<{ id: string }> {
   const metadata = {
     name: filename,
@@ -55,7 +55,21 @@ export async function uploadToGoogleDriveDirect(
     }
   };
 
-  let res = await performUpload(accessToken);
+  let activeToken = accessToken || getAccessToken();
+  if (!activeToken) activeToken = await requestFreshDriveToken(false);
+  if (!activeToken) {
+    throw new Error('Google Drive is not connected. Tap Reconnect Google Drive, then retry the photo.');
+  }
+
+  let res: Response;
+  try {
+    res = await performUpload(activeToken);
+  } catch (error: any) {
+    if (error?.name === 'AbortError') {
+      throw new Error('Google Drive upload timed out. Check your connection and retry.');
+    }
+    throw error;
+  }
 
   // Requirement: On HTTP 401, clear expired token, obtain genuinely new token, and retry ONCE
   if (res.status === 401) {
@@ -63,7 +77,8 @@ export async function uploadToGoogleDriveDirect(
     const freshToken = await requestFreshDriveToken(false);
     if (freshToken) {
       console.log('[DriveDirectUpload] Fresh token obtained. Retrying Drive upload...');
-      res = await performUpload(freshToken);
+      activeToken = freshToken;
+      res = await performUpload(activeToken);
     } else {
       throw new Error('HTTP 401: Google Drive authorization expired—reconnect Drive.');
     }
@@ -79,7 +94,7 @@ export async function uploadToGoogleDriveDirect(
   if (res.status === 429 || res.status >= 500) {
     console.warn(`[DriveDirectUpload] HTTP ${res.status}. Retrying after 1.5s backoff...`);
     await new Promise(r => setTimeout(r, 1500));
-    res = await performUpload(accessToken);
+    res = await performUpload(activeToken);
   }
 
   if (!res.ok) {
@@ -207,59 +222,37 @@ export async function uploadImageToService({
   const ext = targetMimeType === 'image/webp' ? 'webp' : 'jpg';
   const uniqueId = uuidv4().substring(0, 8);
 
-  const storagePath = `users/${userId}/photos/${section}/${recordId}/${uniqueId}-${cleanName}.${ext}`;
-  const thumbStoragePath = thumbnailFile ? `users/${userId}/photos/${section}/${recordId}/${uniqueId}-thumb-${cleanName}.${ext}` : undefined;
+  const plannedStoragePath = `users/${userId}/photos/${section}/${recordId}/${uniqueId}-${cleanName}.${ext}`;
+  const plannedThumbStoragePath = thumbnailFile ? `users/${userId}/photos/${section}/${recordId}/${uniqueId}-thumb-${cleanName}.${ext}` : undefined;
+  const requiresDrive = Boolean(userId && userId !== 'guest');
+
+  let driveFileId: string | null = null;
+  let thumbDriveFileId: string | null = null;
+  let storagePath = '';
+  let downloadURL = '';
+  let thumbStoragePath: string | undefined;
+  let thumbDownloadURL: string | undefined;
 
   if (onProgress) onProgress(25);
 
-  // 1. Upload main optimized file to Firebase Storage
-  const storageRef = ref(storage, storagePath);
-  const snapshot = await withTimeout(
-    uploadBytes(storageRef, targetBlob, { contentType: targetMimeType }),
-    20000,
-    `Firebase storage upload timed out for ${cleanName}`
-  );
-  const downloadURL = await withTimeout(
-    getDownloadURL(snapshot.ref),
-    10000,
-    `Failed to retrieve download URL for ${cleanName}`
-  );
-
-  if (onProgress) onProgress(50);
-
-  // 2. Upload thumbnail file to Firebase Storage if available
-  let thumbDownloadURL: string | undefined = undefined;
-  if (thumbnailFile && thumbStoragePath) {
+  // Drive is the durable primary copy. Firebase Storage is only an optional
+  // mirror, so a bucket/rules error cannot prevent the Drive upload.
+  if (requiresDrive) {
     try {
-      const thumbRef = ref(storage, thumbStoragePath);
-      const thumbSnapshot = await withTimeout(
-        uploadBytes(thumbRef, thumbnailFile, { contentType: thumbnailFile.type || targetMimeType }),
-        15000,
-        `Thumbnail upload timed out`
+      const driveResult = await uploadToGoogleDriveDirect(
+        targetBlob,
+        `${uniqueId}-${cleanName}.${ext}`,
+        targetMimeType,
+        getAccessToken()
       );
-      thumbDownloadURL = await getDownloadURL(thumbSnapshot.ref);
-    } catch (thumbErr) {
-      console.warn('Thumbnail Firebase storage upload skipped or failed:', thumbErr);
-    }
-  }
-
-  if (onProgress) onProgress(75);
-
-  // 3. Backup main photo and thumbnail to Google Drive
-  let driveFileId: string | null = null;
-  let thumbDriveFileId: string | null = null;
-
-  const accessToken = getAccessToken();
-  if (accessToken) {
-    try {
-      const driveResult = await uploadToGoogleDriveDirect(targetBlob, `${uniqueId}-${cleanName}.${ext}`, targetMimeType, accessToken);
-      if (driveResult?.id) {
-        driveFileId = driveResult.id;
-      }
+      driveFileId = driveResult.id;
     } catch (driveErr: any) {
       console.error('Google Drive direct upload error:', driveErr?.message || driveErr);
-      throw new Error(driveErr?.message || "Google Drive upload failed.");
+      throw new Error(driveErr?.message || 'Google Drive upload failed.');
     }
+
+    if (!driveFileId) throw new Error('Google Drive upload did not return a file ID.');
+    if (onProgress) onProgress(55);
 
     if (thumbnailFile) {
       try {
@@ -267,19 +260,50 @@ export async function uploadImageToService({
           thumbnailFile,
           `${uniqueId}-thumb-${cleanName}.${ext}`,
           thumbnailFile.type || targetMimeType,
-          accessToken
+          getAccessToken()
         );
-        if (thumbDriveResult?.id) {
-          thumbDriveFileId = thumbDriveResult.id;
-        }
+        thumbDriveFileId = thumbDriveResult.id;
       } catch (thumbErr) {
-        console.warn('Thumbnail Drive upload warning:', thumbErr);
+        console.warn('Thumbnail Drive upload skipped; main image is saved:', thumbErr);
       }
     }
-  } else {
-    if (userId && userId !== 'guest') {
-      throw new Error("Google Drive is not connected. Please click 'Reconnect Google Drive' to authorize.");
+  }
+
+  if (onProgress) onProgress(70);
+
+  // Prints render from their Drive IDs and must not wait for a broken Firebase
+  // bucket. Other sections retain the existing Firebase mirror for compatibility.
+  if (section !== 'prints') try {
+    const storageRef = ref(storage, plannedStoragePath);
+    const snapshot = await withTimeout(
+      uploadBytes(storageRef, targetBlob, { contentType: targetMimeType }),
+      20000,
+      `Firebase storage upload timed out for ${cleanName}`
+    );
+    downloadURL = await withTimeout(
+      getDownloadURL(snapshot.ref),
+      10000,
+      `Failed to retrieve download URL for ${cleanName}`
+    );
+    storagePath = plannedStoragePath;
+
+    if (thumbnailFile && plannedThumbStoragePath) {
+      try {
+        const thumbRef = ref(storage, plannedThumbStoragePath);
+        const thumbSnapshot = await withTimeout(
+          uploadBytes(thumbRef, thumbnailFile, { contentType: thumbnailFile.type || targetMimeType }),
+          15000,
+          'Thumbnail storage upload timed out'
+        );
+        thumbDownloadURL = await getDownloadURL(thumbSnapshot.ref);
+        thumbStoragePath = plannedThumbStoragePath;
+      } catch (thumbErr) {
+        console.warn('Thumbnail Firebase mirror skipped:', thumbErr);
+      }
     }
+  } catch (storageErr) {
+    console.warn('Firebase Storage mirror skipped; Drive copy remains available:', storageErr);
+    if (!driveFileId) throw storageErr;
   }
 
   if (onProgress) onProgress(100);
