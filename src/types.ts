@@ -1,0 +1,1 @@
+export type ViewState = 'log' | 'mood' | 'streaks' | 'month' | 'notes' | 'charts' | 'printing' | 'reminders' | 'pinterest' | 'habits' | 'wiki' | 'blog' | 'jobs' | 'goals' | 'keychains' | 'minifurniture' | 'settings';

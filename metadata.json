@@ -1,0 +1,6 @@
+{
+  "name": "Serene Stationery",
+  "description": "A mindful digital stationery planner combining tactile paper planning with digital efficiency.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

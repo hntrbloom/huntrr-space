@@ -1,0 +1,76 @@
+{
+  "rules": {
+    "users": {
+      "$userId": {
+        "read": "$userId == request.auth.uid",
+        "write": "$userId == request.auth.uid",
+        "medications": {
+          "$medId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        },
+        "dailyLogs": {
+          "$logId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        },
+        "notes": {
+          "$noteId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        },
+        "printing": {
+          "$buildId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        },
+        "organizer": {
+          "$itemId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        },
+        "reminders": {
+          "$reminderId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        },
+        "blog": {
+          "$blogId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        },
+        "characterWiki": {
+          "$charId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        },
+        "organizerFolders": {
+          "$folderId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        },
+        "moods": {
+          "$moodId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        },
+        "activity": {
+          "$activityId": {
+            "read": "$userId == request.auth.uid",
+            "write": "$userId == request.auth.uid"
+          }
+        }
+      }
+    }
+  }
+}
