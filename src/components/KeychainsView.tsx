@@ -137,7 +137,7 @@ export function KeychainsView() {
     const newUrls: Partial<Charm> = {};
     
     try {
-      await Promise.all(fieldsToUpload.map(async (field) => {
+      for (const field of fieldsToUpload) {
         const originalFile = charm.files?.[field as keyof typeof charm.files];
         if (originalFile) {
           const progressKey = `${charm.id}-${field}`;
@@ -162,7 +162,7 @@ export function KeychainsView() {
             });
           }, 3000);
         }
-      }));
+      }
       
       const finalCharm = {
         ...charm,

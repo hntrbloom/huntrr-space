@@ -5,55 +5,7 @@ import { uploadImageToService } from './imageService';
 import { v4 as uuidv4 } from 'uuid';
 
 export const compressImageIfNeeded = async (file: File): Promise<File> => {
-  const isHeic = /\.(heic|heif)$/i.test(file.name) || /image\/(heic|heif)/i.test(file.type);
-  if (!file.type.startsWith('image/') && !isHeic) return file;
-  if (/image\/(gif|svg\+xml)/i.test(file.type)) return file;
-
-  let source: Blob = file;
-  if (isHeic) {
-    try {
-      const { default: heic2any } = await import('heic2any');
-      const converted = await heic2any({ blob: file, toType: 'image/jpeg', quality: 0.9 });
-      source = Array.isArray(converted) ? converted[0] : converted;
-    } catch (error) {
-      console.warn('[Storage] HEIC conversion unavailable; uploading original file.', error);
-      return file;
-    }
-  }
-  try {
-    const bitmap = await createImageBitmap(source, { imageOrientation: 'from-image' });
-    const scale = Math.min(1, 2560 / Math.max(bitmap.width, bitmap.height));
-    if (!isHeic && scale === 1 && file.size <= 900_000) {
-      bitmap.close();
-      return file;
-    }
-    const width = Math.max(1, Math.round(bitmap.width * scale));
-    const height = Math.max(1, Math.round(bitmap.height * scale));
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const context = canvas.getContext('2d', { alpha: true });
-    if (!context) {
-      bitmap.close();
-      return file;
-    }
-    context.drawImage(bitmap, 0, 0, width, height);
-    bitmap.close();
-    const compressedBlob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, 'image/webp', 0.85);
-    });
-    canvas.width = 1;
-    canvas.height = 1;
-    if (!compressedBlob || (!isHeic && compressedBlob.size >= file.size * 0.95)) return file;
-    const baseName = file.name.replace(/\.[^/.]+$/, '') || 'photo_' + Date.now();
-    return new File([compressedBlob], baseName + '.webp', {
-      type: 'image/webp',
-      lastModified: file.lastModified,
-    });
-  } catch (error) {
-    console.warn('[Storage] Image compression skipped.', error);
-    return file;
-  }
+  return file;
 };
 
 export const withTimeout = <T>(promise: Promise<T>, timeoutMs = 25000, errorMessage = "Request timed out"): Promise<T> => {
@@ -97,14 +49,6 @@ export const uploadFileToStorage = async (
 
   log(`Processing upload for ${file.name}`);
 
-  if (onProgress) onProgress(2);
-  const optimizedFile = await compressImageIfNeeded(file);
-  if (optimizedFile !== file) {
-    const savedPercent = Math.max(0, Math.round((1 - optimizedFile.size / file.size) * 100));
-    log('Optimized ' + file.name + ': ' + formatBytes(file.size) + ' -> ' + formatBytes(optimizedFile.size) + ' (' + savedPercent + '% smaller)');
-  }
-  if (onProgress) onProgress(10);
-
   // Parse section and recordId from path if available
   const pathParts = (path || '').split('/').filter(Boolean);
   const section = pathParts.length > 2 ? pathParts[2] : (pathParts[0] || 'general');
@@ -114,11 +58,11 @@ export const uploadFileToStorage = async (
   if (userId && userId !== 'guest') {
     try {
       const result = await uploadImageToService({
-        file: optimizedFile,
+        file,
         userId,
         section,
         recordId,
-        filename: optimizedFile.name,
+        filename: file.name,
         onProgress
       });
       log(`Primary storage upload complete: ${result.downloadURL}`);
@@ -128,7 +72,7 @@ export const uploadFileToStorage = async (
       if (auth.currentUser?.isAnonymous || String(err).includes('storage/unauthorized') || String(err).includes('timed out')) {
         log(`Falling back to local IndexedDB...`);
         const idbKey = `photo_${Date.now()}_${uuidv4().substring(0, 8)}_${file.name.replace(/[^a-zA-Z0-9_.-]/g, '_')}`;
-        await savePhotoToIDB(idbKey, optimizedFile);
+        await savePhotoToIDB(idbKey, file);
         if (onProgress) onProgress(100);
         return { url: `idb://${idbKey}`, path: idbKey, driveFileId: null };
       }
@@ -141,7 +85,7 @@ export const uploadFileToStorage = async (
   const idbKey = `photo_${Date.now()}_${uuidv4().substring(0, 8)}_${file.name.replace(/[^a-zA-Z0-9_.-]/g, '_')}`;
   try {
     await withTimeout(
-      savePhotoToIDB(idbKey, optimizedFile),
+      savePhotoToIDB(idbKey, file),
       10000,
       "IndexedDB storage timed out"
     );
@@ -205,10 +149,4 @@ export const deleteFileFromStorage = async (path: string): Promise<void> => {
   } catch (error) {
     console.warn("Ignoring error deleting file from storage:", error);
   }
-};
-
-const formatBytes = (bytes: number): string => {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
-  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 };

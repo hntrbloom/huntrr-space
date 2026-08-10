@@ -7,8 +7,7 @@ async function startServer() {
   const PORT = 3000;
 
   // API routes FIRST
-  // Base64 photos exceed Express' 100 KB default; the old limit rejected most backups.
-  app.use(express.json({ limit: "20mb" }));
+  app.use(express.json());
 
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
