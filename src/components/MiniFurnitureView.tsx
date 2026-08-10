@@ -5,7 +5,6 @@ import { saveAs } from 'file-saver';
 import { ImageUploaderArea } from './ui/ImageUploaderArea';
 import { SetGalleryModal } from './SetGalleryModal';
 import { useAuth } from '../lib/AuthContext';
-import { requestFreshDriveToken } from '../lib/driveAuth';
 import { db, safeGetDoc } from '../lib/firebase';
 import { collection, doc, onSnapshot, setDoc, deleteDoc } from 'firebase/firestore';
 import { uploadFileToStorage, uploadDataUrlToStorage, deleteFileFromStorage } from '../lib/storage';
@@ -58,8 +57,8 @@ export function getUniqueImages(images: MiniFurnitureImage[] | undefined | null)
   const seen = new Set<string>();
   const unique: MiniFurnitureImage[] = [];
   for (const img of images) {
-    if (!img || (!img.url && !img.storagePath && !img.driveFileId)) continue;
-    const key = (img.storagePath || img.driveFileId || img.url).trim().toLowerCase();
+    if (!img || !img.url) continue;
+    const key = (img.storagePath || img.url).trim().toLowerCase();
     if (!seen.has(key)) {
       seen.add(key);
       unique.push(img);
@@ -478,8 +477,6 @@ const PrintUploadStatusBadge = ({
     const total = queueState.tasks.length;
     const saved = queueState.tasks.filter(t => t.status === 'saved').length;
     const failed = queueState.tasks.filter(t => t.status === 'failed' || t.status === 'interrupted').length;
-    const firstFailure = queueState.tasks.find(t => t.status === 'failed' || t.status === 'interrupted');
-    const isDriveAuthFailure = Boolean(firstFailure?.error && /drive.*(not connected|authorization)|http 401|oauth/i.test(firstFailure.error));
 
     if (queueState.overallStatus === 'processing') {
       return (
@@ -493,10 +490,7 @@ const PrintUploadStatusBadge = ({
     if (failed > 0) {
       const hasMissingBlob = queueState.tasks.some(t => (t.status === 'failed' || t.status === 'interrupted') && !t.file);
       return (
-        <div
-          className="inline-flex items-center gap-2 bg-error/10 text-error px-2.5 py-1 rounded-full text-xs font-bold border border-error/20 shrink-0"
-          title={firstFailure?.error || 'Photo upload failed'}
-        >
+        <div className="inline-flex items-center gap-2 bg-error/10 text-error px-2.5 py-1 rounded-full text-xs font-bold border border-error/20 shrink-0">
           <span>{failed} photo{failed > 1 ? 's' : ''} {hasMissingBlob ? 'interrupted' : 'failed'}</span>
           {hasMissingBlob ? (
             <button
@@ -512,23 +506,14 @@ const PrintUploadStatusBadge = ({
           ) : (
             <button
               type="button"
-              onClick={async (e) => {
+              onClick={(e) => {
                 e.stopPropagation();
-                if (isDriveAuthFailure) {
-                  const token = await requestFreshDriveToken(true);
-                  if (!token) return;
-                }
                 printUploadQueue.retryFailedPhotos(item.id);
               }}
               className="text-primary hover:underline font-extrabold bg-white px-2 py-0.5 rounded-full shadow-sm text-[11px]"
             >
-              {isDriveAuthFailure ? 'Reconnect Drive' : 'Retry'}
+              Retry
             </button>
-          )}
-          {firstFailure?.error && (
-            <span className="max-w-[260px] truncate font-medium" aria-live="polite">
-              {firstFailure.error}
-            </span>
           )}
         </div>
       );
@@ -1921,31 +1906,19 @@ const FurnitureFormModal = ({ item, categories, printSets, items, onClose, onSav
 
     try {
       const printId = formData.id || uuidv4();
-      const currentUserId = user?.isAnonymous ? 'guest' : (user?.uid || 'guest');
+      const currentUserId = user?.uid || 'guest';
       const isMiniCharm = isMiniCharmItem(formData);
 
       // Collect existing clean images that are already saved
       const cleanExistingImages: MiniFurnitureImage[] = (formData.images || [])
-        .filter(img => img && (
-          img.driveFileId ||
-          img.storagePath ||
-          (img.url && !img.url.startsWith('blob:') && !img.url.startsWith('data:') && !img.url.startsWith('file:'))
-        ))
+        .filter(img => img && img.url && !img.url.startsWith('blob:') && !img.url.startsWith('data:'))
         .map(img => {
           const meta: MiniFurnitureImage = {
             id: img.id || uuidv4(),
-            url: img.url || '',
+            url: img.url,
             type: img.type || 'design'
           };
           if (img.storagePath) meta.storagePath = img.storagePath;
-          if (img.driveFileId) meta.driveFileId = img.driveFileId;
-          if (img.thumbDriveFileId) meta.thumbDriveFileId = img.thumbDriveFileId;
-          if (img.thumbStoragePath) meta.thumbStoragePath = img.thumbStoragePath;
-          if (img.mimeType) meta.mimeType = img.mimeType;
-          if (img.width) meta.width = img.width;
-          if (img.height) meta.height = img.height;
-          if (img.filename) meta.filename = img.filename;
-          if (img.status) meta.status = img.status;
           if (img.label) meta.label = img.label;
           return meta;
         });
@@ -2343,4 +2316,5 @@ const CategoryManagerModal = ({ categories, onClose, onSave }: { categories: str
     </div>
   );
 };
+
 

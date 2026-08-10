@@ -99,13 +99,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logOut = async () => {
     try {
       setLocalGuest(false);
-      setAccessToken(null);
       await signOut(auth);
       setUser(null);
+      cachedAccessToken = null;
     } catch (error) {
       console.error('Error signing out', error);
       setLocalGuest(false);
-      setAccessToken(null);
       setUser(null);
     }
   };

@@ -95,7 +95,7 @@ export const useImageCache = (storagePath?: string, src?: string, driveFileId?: 
     }
 
     // 3. If cleanSrc is valid HTTP/HTTPS/data/blob URL, return it immediately
-    if (!cleanDriveId && cleanSrc && !cleanSrc.startsWith('idb://') && !cleanSrc.startsWith('photo_')) {
+    if (cleanSrc && !cleanSrc.startsWith('idb://') && !cleanSrc.startsWith('photo_')) {
       return cleanSrc;
     }
 
@@ -132,7 +132,7 @@ export const useImageCache = (storagePath?: string, src?: string, driveFileId?: 
         setHasError(false);
         return;
       }
-      if (!cleanDriveId && cleanSrc && !isTempUrl(cleanSrc) && displayUrl === cleanSrc) {
+      if (cleanSrc && !isTempUrl(cleanSrc) && displayUrl === cleanSrc) {
         setIsLoading(false);
         setHasError(false);
         return;
